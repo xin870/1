@@ -1,0 +1,258 @@
+from flask import Flask, render_template, url_for, redirect, request, jsonify,flash
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from datetime import datetime
+from flask_httpauth import HTTPBasicAuth
+from flask_caching import Cache
+import re
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Liuzhixin2004@localhost/dbname'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['CACHE_TYPE'] = 'simple'  # 使用简单的内存缓存
+cache = Cache(app)
+app.secret_key = 'your_secret_key'
+
+db = SQLAlchemy()
+db.init_app(app)
+
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+auth = HTTPBasicAuth()
+
+ROLE_USER = 'user'
+ROLE_ADMIN = 'admin'
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    email = db.Column(db.String(150), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(50), default=ROLE_USER)
+    posts = db.relationship('Post', backref='author', lazy=True)
+
+class Post(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(150), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    date_posted = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+class Comment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.Text, nullable=False)
+    date_posted = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    post_id = db.Column(db.Integer, db.ForeignKey('post.id'), nullable=False)
+
+    user = db.relationship('User', backref='comments', lazy=True)
+    post = db.relationship('Post', backref='comments', lazy=True)
+
+    def __repr__(self):
+        return f"Comment('{self.content}', '{self.date_posted}')"
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@auth.verify_password
+def verify_password(username, password):
+    user = User.query.filter_by(username=username).first()
+    if user and check_password_hash(user.password_hash, password):
+        return user
+
+@app.route('/api/posts', methods=['GET'])
+def get_posts():
+    posts = Post.query.order_by(Post.date_posted.desc()).all()
+    posts_data = [
+        {'id': post.id, 'title': post.title, 'content': post.content, 'author': post.author.username}
+        for post in posts
+    ]
+    return jsonify(posts_data)
+
+@app.route('/api/posts', methods=['POST'])
+@auth.login_required
+def createpost():
+    title = request.json.get('title')
+    content = request.json.get('content')
+
+    if not title or not content:
+        return jsonify({'message': 'Title and content are required'}), 400
+
+    new_post = Post(title=title, content=content, user_id=current_user.id)
+    db.session.add(new_post)
+    db.session.commit()
+
+    return jsonify({'id': new_post.id, 'title': new_post.title, 'content': new_post.content}), 201
+
+@app.route('/api/posts/<int:id>', methods=['PUT'])
+@auth.login_required
+def update_post(id):
+    post = Post.query.get_or_404(id)
+    if post.author != current_user and current_user.role != ROLE_ADMIN:
+        return jsonify({'message': 'Unauthorized'}), 403
+
+    title = request.json.get('title', post.title)
+    content = request.json.get('content', post.content)
+
+    post.title = title
+    post.content = content
+    db.session.commit()
+
+    return jsonify({'id': post.id, 'title': post.title, 'content': post.content})
+
+@app.route('/api/posts/<int:id>', methods=['DELETE'])
+@auth.login_required
+def deletepost(id):
+    post = Post.query.get_or_404(id)
+    if post.author != current_user and current_user.role != ROLE_ADMIN:
+        return jsonify({'message': 'Unauthorized'}), 403
+
+    db.session.delete(post)
+    db.session.commit()
+
+    return jsonify({'message': 'Post deleted successfully'})
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if current_user.role != ROLE_ADMIN:
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+
+        existing_user = User.query.filter_by(username=username).first()
+        existing_email = User.query.filter_by(email=email).first()
+
+        if existing_user:
+            return "Username already exists. Please choose another username."
+        if existing_email:
+            return "Email is already registered. Please use another email."
+
+        hashed_password = generate_password_hash(password)
+        new_user = User(username=username, email=email, password_hash=hashed_password, role='user')
+        db.session.add(new_user)
+        db.session.commit()
+        login_user(new_user)
+        return redirect(url_for('dashboard'))
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password_hash, password):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+    return render_template('login.html')
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+@app.route('/dashboard', methods=['GET', 'POST'])
+@login_required
+def dashboard():
+    posts = Post.query.filter_by(user_id=current_user.id).all()
+    return render_template('dashboard.html', posts=posts)
+
+@app.route('/create_post', methods=['GET', 'POST'])
+@login_required
+def create_post():
+    if request.method == 'POST':
+        title = request.form['title']
+        content = request.form['content']
+        new_post = Post(title=title, content=content, author=current_user)
+        db.session.add(new_post)
+        db.session.commit()
+        return redirect(url_for('dashboard'))
+    return render_template('create_post.html')
+
+@app.route('/edit_post/<int:post_id>', methods=['GET', 'POST'])
+@login_required
+def edit_post(post_id):
+    post = Post.query.get_or_404(post_id)
+    if post.author != current_user:
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        post.title = request.form['title']
+        post.content = request.form['content']
+        db.session.commit()
+        return redirect(url_for('dashboard'))
+    return render_template('edit_post.html', post=post)
+
+@app.route('/delete_post/<int:post_id>', methods=['POST'])
+@login_required
+def delete_post(post_id):
+    post = Post.query.get_or_404(post_id)
+    if post.author != current_user and current_user.role != ROLE_ADMIN:
+        return jsonify({'message': 'Unauthorized'}), 403
+    Comment.query.filter_by(post_id=post.id).delete()
+    db.session.delete(post)
+    db.session.commit()
+    flash('文章已成功删除！', 'success')
+    return redirect(request.referrer or url_for('index'))
+
+@app.route('/admin')
+@login_required
+@admin_required
+def admin():
+    posts = Post.query.all()
+    return render_template('admin.html', posts=posts)
+
+@app.route('/load_more_posts', methods=['GET'])
+def load_more_posts():
+    offset = int(request.args.get('offset', 0))
+    limit = 5
+    posts = Post.query.order_by(Post.date_posted.desc()).offset(offset).limit(limit).all()
+    posts_data = [
+        {'id': post.id, 'title': post.title, 'content': post.content, 'author': post.author.username}
+        for post in posts
+    ]
+    return jsonify(posts_data)
+
+@app.route('/post/<int:post_id>', methods=['GET', 'POST'])
+def post_detail(post_id):
+    post = Post.query.get_or_404(post_id)
+    comments = Comment.query.filter_by(post_id=post_id).all()
+
+    if request.method == 'POST':
+        content = request.form['content']
+        new_comment = Comment(content=content, post_id=post_id, user_id=current_user.id)
+        db.session.add(new_comment)
+        db.session.commit()
+        return redirect(url_for('post_detail', post_id=post_id))
+    return render_template('post_detail.html', post=post, comments=comments)
+
+@app.route('/delete_comment/<int:comment_id>', methods=['POST'])
+@login_required
+def delete_comment(comment_id):
+    comment = Comment.query.get_or_404(comment_id)
+    post = comment.post
+    if comment.user != current_user and post.author != current_user and current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    db.session.delete(comment)
+    db.session.commit()
+    flash('评论删除成功！', 'success')
+    return redirect(request.referrer)
+@app.route('/')
+def index():
+    page = request.args.get('page', 1, type=int)
+    posts = Post.query.order_by(Post.date_posted.desc()).paginate(page=page, per_page=5)
+    return render_template('index.html', posts=posts)
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
